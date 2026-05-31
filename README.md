@@ -2,10 +2,13 @@
 
 Um widget de **bandeja do sistema (system tray)** para Windows que monitora o
 quanto da sua conta Claude (assinatura Pro/Max) já foi consumido. É o
-equivalente Windows do widget de Waybar deste repositório (`ai-usagebar`),
-que só funciona no Linux.
+equivalente Windows do widget de Waybar do projeto
+[`ai-usagebar`](https://github.com/akitaonrails/ai-usagebar), que só funciona no Linux.
 
-![tray](https://img.shields.io/badge/Windows-tray%20widget-blue)
+[![Baixar .exe](https://img.shields.io/badge/Baixar-ClaudeUsageTray.exe-2ea44f?style=for-the-badge&logo=windows)](https://github.com/tedrc/ai-usage/releases/latest/download/ClaudeUsageTray.exe)
+
+> **Download rápido:** clique no botão acima para baixar o executável pronto
+> (não precisa de Python). Veja a [página de releases](https://github.com/tedrc/ai-usage/releases) para todas as versões.
 
 ---
 
