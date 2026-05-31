@@ -1,0 +1,17 @@
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Executáveis e artefatos compilados
+*.exe
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Credenciais — nunca commitar
+.credentials.json
+*.credentials.json
