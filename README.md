@@ -20,7 +20,21 @@ equivalente Windows do widget de Waybar do projeto
   - 🔴 **vermelho** — 90% ou mais (quase no limite)
 - **Tooltip** (passar o mouse): plano + uso das janelas de 5h e 7 dias.
 - **Janela de detalhes** (clique no ícone): explica cada limite com barra de
-  progresso, percentual, quando reseta e um conselho automático.
+  progresso, percentual, quando reseta e um conselho automático. Agora também
+  mostra **tendência** (↑/↓ %/hora) e **projeção** de quando cada janela
+  atinge 100% no ritmo atual.
+- **Tokens reais** (menu → *Tokens reais (7 dias)*): consumo de tokens de
+  verdade lido dos logs do Claude Code. Mostra **entrada+saída** (o que você
+  de fato gastou) separado do **cache** (leituras enormes mas baratas), com
+  **quebra por modelo** (Opus/Sonnet/Haiku). Mensagens repetidas no log
+  (streaming, turnos de ferramenta, sessões retomadas) são deduplicadas por
+  `message.id`. O custo em US$ é só **referência de volume** a preço de API
+  público — em planos Pro/Max/Enterprise não há cobrança por token.
+- **Notificações**: toast do Windows quando uma janela cruza 70%, 90% ou 100%.
+- **Atualizar agora** (menu): força uma atualização imediata sem esperar o
+  ciclo de 5 minutos.
+- **Histórico**: cada leitura é gravada num banco SQLite local
+  (`~/.claude/usage_tray_history.db`) — base para tendência e projeção.
 
 ### As janelas de limite
 
@@ -30,6 +44,16 @@ equivalente Windows do widget de Waybar do projeto
 | **7 dias (todos os modelos)** | Limite semanal geral — costuma ser o que trava o uso por mais tempo. |
 | **7 dias (Sonnet)** | Limite semanal específico do modelo Sonnet. |
 | **Créditos extras** | Pay-as-you-go: cobrança avulsa quando o plano se esgota (se habilitado). |
+
+### Tokens reais vs. percentual de limite
+
+O endpoint da Anthropic só informa **% de utilização** de cada janela — não
+quantos tokens você gastou. Os tokens reais vêm de outra fonte: os logs de
+sessão que o Claude Code grava em `~/.claude/projects/*/*.jsonl`. O widget
+soma `input`, `output` e `cache` por modelo e estima o custo a preço de API
+público (seu plano é fixo; o valor é só referência de "quanto custaria via
+API"). Tabela de preços fica em `_PRICING` no `usage_extras.py` — ajuste se
+os preços mudarem.
 
 ---
 
@@ -87,6 +111,8 @@ Edite as constantes no topo de `claude_usage_tray.py`:
 |---|---|---|
 | `POLL_INTERVAL_SECS` | `300` | Frequência de atualização (segundos). |
 | `CREDS_PATH` | `~/.claude/.credentials.json` | Caminho das credenciais (ajuste se usa WSL). |
+| `_PRICING` (em `usage_extras.py`) | preços públicos | Tabela US$/1M tokens por modelo, usada no custo estimado. |
+| `_THRESHOLDS` (em `usage_extras.py`) | `(70, 90, 100)` | Níveis que disparam notificação toast. |
 
 Depois de editar, **reconstrua o .exe** (veja abaixo).
 
@@ -122,7 +148,8 @@ O `.exe` resultante fica nesta pasta. As pastas `build/` são temporárias.
 
 | Arquivo | Descrição |
 |---|---|
-| `claude_usage_tray.py` | Código-fonte do widget. |
+| `claude_usage_tray.py` | Código-fonte do widget (tray, janelas, poll loop). |
+| `usage_extras.py` | Analytics: histórico, projeção, tokens reais, custo, notificações. |
 | `ClaudeUsageTray.exe` | Executável standalone (gerado pelo PyInstaller). |
 | `install-startup.ps1` | Cria o atalho de inicialização automática. |
 | `README.md` | Esta documentação. |

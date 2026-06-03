@@ -28,6 +28,8 @@ import requests
 from PIL import Image, ImageDraw, ImageFont
 from pystray import Icon, Menu, MenuItem
 
+import usage_extras
+
 # --- Constants mirrored from this repo (src/anthropic/{fetch,oauth}.rs) -----
 CREDS_PATH = Path.home() / ".claude" / ".credentials.json"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -41,6 +43,9 @@ POLL_INTERVAL_SECS = 300  # how often we re-fetch usage
 # Latest fetch result, shared between the poll loop and the detail window.
 _state: dict = {"usage": None, "plan": "?", "error": None, "fetched_at": None}
 _state_lock = threading.Lock()
+
+# Set by "Atualizar agora" to wake the poll loop immediately.
+_refresh_now = threading.Event()
 
 
 # --- Credentials + token refresh -------------------------------------------
@@ -121,6 +126,32 @@ def pct_of(usage: dict, key: str) -> int | None:
     return round(float(win.get("utilization", 0)))
 
 
+def financial_pct(usage: dict) -> int | None:
+    """Spend utilization (%) from the financial cap. Used by Enterprise/PAYG
+    plans where the percentage windows come back null and the real limit is a
+    monthly US$ budget (extra_usage)."""
+    extra = usage.get("extra_usage")
+    if not extra or not extra.get("is_enabled"):
+        return None
+    util = extra.get("utilization")
+    if util is None:
+        return None
+    return round(float(util))
+
+
+def overall_pct(usage: dict) -> int:
+    """Highest utilization across every signal available, financial included.
+    Enterprise has null %-windows, so without the financial fallback the icon
+    would sit at 0 forever."""
+    vals = [
+        pct_of(usage, "five_hour"),
+        pct_of(usage, "seven_day"),
+        pct_of(usage, "seven_day_sonnet"),
+        financial_pct(usage),
+    ]
+    return max((v for v in vals if v is not None), default=0)
+
+
 def humanize_reset(usage: dict, key: str) -> str:
     """Return 'em 3h 12min (14:30)' or '' if no reset timestamp."""
     win = usage.get(key) or {}
@@ -191,6 +222,13 @@ def short_tooltip(usage: dict, plan: str) -> str:
         lines.append(f"5h:  {h5}%")
     if d7 is not None:
         lines.append(f"7d:  {d7}%")
+    extra = usage.get("extra_usage")
+    if extra and extra.get("is_enabled"):
+        cur = extra.get("currency", "USD")
+        used = extra.get("used_credits", 0) / 100
+        limit = extra.get("monthly_limit", 0) / 100
+        fp = financial_pct(usage)
+        lines.append(f"Gasto: {cur} {used:.2f}/{limit:.2f} ({fp}%)")
     lines.append("(clique para detalhes)")
     return "\n".join(lines)
 
@@ -227,6 +265,13 @@ def build_detail_text() -> str:
         reset = humanize_reset(usage, key)
         out.append(f"▶ {title}")
         out.append(f"   {bar}  {pct}%  —  {advice(pct)}")
+        trend = usage_extras.trend_arrow(key)
+        proj = usage_extras.project_full(key)
+        if trend:
+            line = f"   Tendência: {trend}"
+            if proj:
+                line += f"  ·  {proj}"
+            out.append(line)
         if reset:
             out.append(f"   Reseta {reset}")
         out.append(f"   {explain}")
@@ -241,29 +286,58 @@ def build_detail_text() -> str:
         out.append("   Cobrança avulsa quando os limites do plano se esgotam.")
         out.append("")
 
+    try:
+        tok = usage_extras.token_block(since_hours=24)
+        if tok:
+            out.extend(tok)
+            out.append("")
+    except Exception as exc:  # log parsing must never break the window
+        out.append(f"(tokens reais indisponíveis: {exc})")
+        out.append("")
+
     if fetched_at:
         out.append(f"Atualizado: {fetched_at:%d/%m %H:%M:%S}  (atualiza a cada {POLL_INTERVAL_SECS // 60} min)")
     return "\n".join(out)
 
 
-def show_detail_window() -> None:
-    """Open the detail window in its own Tk mainloop (own thread)."""
+def _show_text_window(title: str, body: str, geometry: str = "520x460") -> None:
+    """Open a read-only dark text window in its own Tk mainloop (own thread)."""
     def run() -> None:
         root = tk.Tk()
-        root.title("Limites de uso — Claude")
-        root.geometry("520x460")
+        root.title(title)
+        root.geometry(geometry)
         root.configure(bg="#1e1e2e")
         text = tk.Text(
             root, wrap="word", bg="#1e1e2e", fg="#e0e0e0",
             font=("Consolas", 11), borderwidth=0, padx=16, pady=14,
         )
-        text.insert("1.0", build_detail_text())
+        text.insert("1.0", body)
         text.configure(state="disabled")
         text.pack(fill="both", expand=True)
         root.attributes("-topmost", True)
         root.mainloop()
 
     threading.Thread(target=run, daemon=True).start()
+
+
+def show_detail_window() -> None:
+    _show_text_window("Limites de uso — Claude", build_detail_text())
+
+
+def build_token_text() -> str:
+    """7-day real-token breakdown from the Claude Code session logs."""
+    try:
+        block = usage_extras.token_block(since_hours=24 * 7)
+    except Exception as exc:
+        return f"Erro ao ler logs de sessão:\n\n{exc}"
+    if not block:
+        return ("Nenhum uso de token encontrado nos últimos 7 dias.\n\n"
+                "Os dados vêm de ~/.claude/projects/*.jsonl (logs do Claude Code).")
+    return "\n".join(block)
+
+
+def show_token_window() -> None:
+    _show_text_window("Tokens reais (7 dias) — Claude", build_token_text())
 
 
 # --- Poll loop --------------------------------------------------------------
@@ -274,16 +348,25 @@ def update_loop(icon: Icon) -> None:
             with _state_lock:
                 _state.update(usage=usage, plan=plan, error=None,
                               fetched_at=datetime.now())
-            h5 = pct_of(usage, "five_hour") or 0
-            d7 = pct_of(usage, "seven_day") or 0
-            icon.icon = make_icon_image(max(h5, d7))
+            try:
+                usage_extras.record_history(usage)
+                for label, band in usage_extras.threshold_crossings(usage):
+                    icon.notify(
+                        f"{label} chegou a {band}% do limite.",
+                        "Claude — uso alto",
+                    )
+            except Exception:
+                pass  # analytics must never crash the tray
+            icon.icon = make_icon_image(overall_pct(usage))
             icon.title = short_tooltip(usage, plan)
         except Exception as exc:  # never crash the tray; surface the error
             with _state_lock:
                 _state.update(error=str(exc), fetched_at=datetime.now())
             icon.icon = make_icon_image(0)
             icon.title = f"Claude — erro\n{exc}"
-        time.sleep(POLL_INTERVAL_SECS)
+        # Wake early if "Atualizar agora" was clicked; else poll on schedule.
+        _refresh_now.wait(POLL_INTERVAL_SECS)
+        _refresh_now.clear()
 
 
 def main() -> None:
@@ -294,7 +377,8 @@ def main() -> None:
         menu=Menu(
             MenuItem("Detalhes dos limites", lambda i: show_detail_window(),
                      default=True),
-            MenuItem("Atualizar agora", lambda i: None, enabled=False),
+            MenuItem("Tokens reais (7 dias)", lambda i: show_token_window()),
+            MenuItem("Atualizar agora", lambda i: _refresh_now.set()),
             Menu.SEPARATOR,
             MenuItem("Sair", lambda i: i.stop()),
         ),
