@@ -30,13 +30,14 @@ CLAUDE_DIR = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 DB_PATH = CLAUDE_DIR / "usage_tray_history.db"
 
-# --- Pricing (USD per 1M tokens, public list prices) ------------------------
-# input / output / cache_read / cache_write(5m). Matched by substring on the
-# model id (longest match wins). Update when prices change.
+# --- Pricing (USD per 1M tokens, public list prices, 2026-06) ----------------
+# input / output / cache_read (0.1x in) / cache_write 5m (1.25x in). Matched by
+# substring on the model id (first match wins). Update when prices change.
 _PRICING = {
-    "opus":   {"in": 15.0, "out": 75.0, "cache_read": 1.50, "cache_write": 18.75},
+    "fable":  {"in": 10.0, "out": 50.0, "cache_read": 1.00, "cache_write": 12.50},
+    "opus":   {"in": 5.0,  "out": 25.0, "cache_read": 0.50, "cache_write": 6.25},
     "sonnet": {"in": 3.0,  "out": 15.0, "cache_read": 0.30, "cache_write": 3.75},
-    "haiku":  {"in": 0.80, "out": 4.0,  "cache_read": 0.08, "cache_write": 1.00},
+    "haiku":  {"in": 1.0,  "out": 5.0,  "cache_read": 0.10, "cache_write": 1.25},
 }
 _DEFAULT_PRICE = _PRICING["sonnet"]
 
@@ -73,6 +74,15 @@ def _connect() -> sqlite3.Connection:
                seven_sonnet REAL
            )"""
     )
+    # Older DBs predate the financial-cap columns (Enterprise fallback).
+    for ddl in (
+        "ALTER TABLE history ADD COLUMN extra_util REAL",
+        "ALTER TABLE history ADD COLUMN used_cents REAL",
+    ):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass  # column already exists
     return conn
 
 
@@ -82,18 +92,27 @@ def record_history(usage: dict) -> None:
         win = usage.get(key)
         return None if not win else float(win.get("utilization", 0))
 
+    extra = usage.get("extra_usage") or {}
+    extra_util = extra.get("utilization") if extra.get("is_enabled") else None
+    used_cents = extra.get("used_credits") if extra.get("is_enabled") else None
+
     row = (
         datetime.now(timezone.utc).isoformat(),
         pct("five_hour"),
         pct("seven_day"),
         pct("seven_day_sonnet"),
+        None if extra_util is None else float(extra_util),
+        None if used_cents is None else float(used_cents),
     )
     with _db_lock, _connect() as conn:
         conn.execute(
-            "INSERT INTO history (ts, five_hour, seven_day, seven_sonnet) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO history (ts, five_hour, seven_day, seven_sonnet, "
+            "extra_util, used_cents) VALUES (?, ?, ?, ?, ?, ?)",
             row,
         )
+        # Keep the DB bounded now that we poll every minute.
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        conn.execute("DELETE FROM history WHERE ts < ?", (cutoff,))
 
 
 def history_rows(window: str, since_hours: float) -> list[tuple[datetime, float]]:
@@ -102,6 +121,8 @@ def history_rows(window: str, since_hours: float) -> list[tuple[datetime, float]
         "five_hour": "five_hour",
         "seven_day": "seven_day",
         "seven_day_sonnet": "seven_sonnet",
+        "extra": "extra_util",
+        "used_cents": "used_cents",
     }[window]
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=since_hours)).isoformat()
     with _db_lock, _connect() as conn:
@@ -198,11 +219,15 @@ def _iter_assistant_usages(since: datetime):
                     usage = msg.get("usage")
                     if not usage:
                         continue
+                    if msg.get("model") == "<synthetic>":
+                        continue  # Claude Code internal placeholder, no real spend
                     # message.id (fallback requestId) identifies a unique API
                     # response; the same one is logged many times across
                     # streaming/tool turns and resumed sessions — caller dedupes.
                     msg_id = msg.get("id") or obj.get("requestId")
-                    yield msg_id, ts, msg.get("model", "?"), usage
+                    session = obj.get("sessionId") or Path(fp).stem
+                    yield (msg_id, ts, msg.get("model", "?"), usage,
+                           session, obj.get("cwd", ""))
         except OSError:
             continue
 
@@ -226,34 +251,86 @@ def _add_usage(bucket: dict, model: str, usage: dict) -> None:
     ) / 1_000_000
 
 
-def token_report(since_hours: float = 24) -> dict:
-    """Aggregate real token spend over the last `since_hours`.
+def _collect_best(since: datetime) -> list[tuple]:
+    """Deduped API responses newer than `since`.
 
-    Returns {total, by_model: {name: bucket}, by_project: {name: bucket}}.
-    Each bucket has in/out/cache_read/cache_write token counts + cost (USD).
+    A single API response is logged several times (streaming partials, tool
+    turns, resumed sessions). Most dupes are identical, but streaming partials
+    share the message.id with a lower output_tokens than the final row. Keep
+    the row with the highest output_tokens per id = the completed response.
+
+    Returns [(ts, model, usage, session, cwd)].
     """
-    since = datetime.now(timezone.utc) - timedelta(hours=since_hours)
-    # A single API response is logged several times (streaming partials, tool
-    # turns, resumed sessions). Most dupes are identical, but streaming partials
-    # share the message.id with a lower output_tokens than the final row. Keep
-    # the row with the highest output_tokens per id = the completed response.
     best: dict = {}
     n = 0
-    for msg_id, ts, model, usage in _iter_assistant_usages(since):
+    for msg_id, ts, model, usage, session, cwd in _iter_assistant_usages(since):
         n += 1
         key = msg_id if msg_id is not None else f"__noid_{n}"
         out = int(usage.get("output_tokens", 0))
         prev = best.get(key)
-        if prev is None or out > prev[1]:
-            best[key] = (model, out, usage)
+        if prev is None or out > prev[0]:
+            best[key] = (out, ts, model, usage, session, cwd)
+    return [(ts, model, usage, session, cwd)
+            for _out, ts, model, usage, session, cwd in best.values()]
 
+
+def token_report(since_hours: float = 24) -> dict:
+    """Aggregate real token spend over the last `since_hours`.
+
+    Returns {total, by_model: {name: bucket}}.
+    Each bucket has in/out/cache_read/cache_write token counts + cost (USD).
+    """
+    since = datetime.now(timezone.utc) - timedelta(hours=since_hours)
     total = _blank_bucket()
     by_model: dict[str, dict] = defaultdict(_blank_bucket)
-    for model, _out, usage in best.values():
+    for _ts, model, usage, _session, _cwd in _collect_best(since):
         name = _short_model(model)
         _add_usage(total, model, usage)
         _add_usage(by_model[name], model, usage)
     return {"total": total, "by_model": dict(by_model)}
+
+
+def session_report(since_hours: float = 2.0) -> list[dict]:
+    """Per-conversation spend, most recent activity first.
+
+    Each entry: {label, first, last, bucket, models: set}.
+    """
+    since = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+    sessions: dict[str, dict] = {}
+    for ts, model, usage, session, cwd in _collect_best(since):
+        entry = sessions.get(session)
+        if entry is None:
+            label = Path(cwd).name if cwd else session[:8]
+            entry = sessions[session] = {
+                "label": label, "first": ts, "last": ts,
+                "bucket": _blank_bucket(), "models": set(),
+            }
+        entry["first"] = min(entry["first"], ts)
+        entry["last"] = max(entry["last"], ts)
+        entry["models"].add(_short_model(model))
+        _add_usage(entry["bucket"], model, usage)
+    return sorted(sessions.values(), key=lambda e: e["last"], reverse=True)
+
+
+def activity_buckets(minutes: int = 60, bucket_min: int = 10) -> list[tuple[datetime, dict]]:
+    """Token spend in fixed time buckets over the last `minutes`.
+
+    Returns [(bucket_start_local, bucket)] oldest first, empty buckets included
+    so gaps (pauses) are visible.
+    """
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(minutes=minutes)
+    n_buckets = max(1, minutes // bucket_min)
+    buckets = [_blank_bucket() for _ in range(n_buckets)]
+    for ts, model, usage, _session, _cwd in _collect_best(since):
+        idx = int((ts - since).total_seconds() // (bucket_min * 60))
+        if 0 <= idx < n_buckets:
+            _add_usage(buckets[idx], model, usage)
+    out = []
+    for i, b in enumerate(buckets):
+        start = (since + timedelta(minutes=i * bucket_min)).astimezone()
+        out.append((start, b))
+    return out
 
 
 # =====================================================================
@@ -301,6 +378,87 @@ def token_block(since_hours: float = 24) -> list[str]:
         f"   Se fosse pago por API (preço público): ~US$ {t['cost']:.2f}. "
         "No Enterprise não é cobrado — só referência de volume."
     )
+    return out
+
+
+def utilization_delta(window: str, since_hours: float) -> tuple[float, float] | None:
+    """(oldest_pct, newest_pct) within the window, or None if <2 samples."""
+    rows = history_rows(window, since_hours)
+    if len(rows) < 2:
+        return None
+    return rows[0][1], rows[-1][1]
+
+
+def impact_block(since_minutes: int = 60) -> list[str]:
+    """How much each limit window moved in the last N minutes."""
+    hours = since_minutes / 60
+    lines = []
+    for key, label in (
+        ("five_hour", "5h"),
+        ("seven_day", "7d"),
+        ("seven_day_sonnet", "7d Sonnet"),
+        ("extra", "Cap financeiro"),
+    ):
+        d = utilization_delta(key, hours)
+        if d is None:
+            continue
+        v0, v1 = d
+        delta = v1 - v0
+        if abs(delta) < 0.5:
+            sign = "±0 pontos"
+        else:
+            unit = "ponto" if abs(round(delta)) == 1 else "pontos"
+            sign = f"{delta:+.0f} {unit}"
+        lines.append(f"   {label + ':':<15} {v0:.0f}% → {v1:.0f}%  ({sign})")
+    dc = utilization_delta("used_cents", hours)
+    if dc is not None and dc[1] > dc[0]:
+        lines.append(
+            f"   {'Gasto:':<15} US$ {dc[0] / 100:.2f} → US$ {dc[1] / 100:.2f}"
+            f"  (+{(dc[1] - dc[0]) / 100:.2f})"
+        )
+    if not lines:
+        return []
+    return [f"▶ Impacto nos limites (últimos {since_minutes} min)"] + lines + [
+        "   Quanto do limite essa última hora de uso consumiu.",
+    ]
+
+
+def activity_block(minutes: int = 60, bucket_min: int = 10) -> list[str]:
+    """Timeline of token spend in fixed buckets + per-conversation breakdown."""
+    out: list[str] = []
+
+    buckets = activity_buckets(minutes, bucket_min)
+    peak = max((b["in"] + b["out"] for _s, b in buckets), default=0)
+    if peak > 0:
+        out.append(f"▶ Atividade por período (últimos {minutes} min, tokens in+out)")
+        for start, b in buckets:
+            io = b["in"] + b["out"]
+            bar = "█" * round(io / peak * 12) if io else ""
+            end = start + timedelta(minutes=bucket_min)
+            val = _fmt_tokens(io) if io else "—"
+            out.append(f"   {start:%H:%M}–{end:%H:%M}  {val:>6}  {bar}")
+        out.append("")
+
+    sessions = session_report(since_hours=max(2.0, minutes / 60))
+    if sessions:
+        out.append("▶ Por conversa (últimas 2h ou mais)")
+        for e in sessions[:8]:
+            b = e["bucket"]
+            io = b["in"] + b["out"]
+            cache = b["cache_read"] + b["cache_write"]
+            models = "/".join(sorted(e["models"]))
+            out.append(
+                f"   • {e['label']} ({models})  {e['first'].astimezone():%H:%M}–"
+                f"{e['last'].astimezone():%H:%M}"
+            )
+            out.append(
+                f"     {_fmt_tokens(io)} in+out · {_fmt_tokens(cache)} cache"
+                f" · ~US$ {b['cost']:.2f} eq. API"
+            )
+        if len(sessions) > 8:
+            out.append(f"   … e mais {len(sessions) - 8} conversas")
+        out.append("")
+
     return out
 
 
