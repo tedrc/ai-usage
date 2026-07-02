@@ -28,7 +28,22 @@ import requests
 from PIL import Image, ImageDraw, ImageFont
 from pystray import Icon, Menu, MenuItem
 
+# Trust the OS certificate store (Windows) so corporate TLS-intercepting
+# proxies whose root CA is installed system-wide are accepted. Without this,
+# requests uses certifi's bundle, which doesn't know the corp CA and fails
+# with CERTIFICATE_VERIFY_FAILED behind such proxies.
+try:
+    import truststore
+
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
+
 import usage_extras
+
+# Windows tray tooltips are hard-capped at 128 chars; longer strings make
+# pystray raise ValueError and kill the poll thread.
+TOOLTIP_MAX = 127
 
 # --- Constants mirrored from this repo (src/anthropic/{fetch,oauth}.rs) -----
 CREDS_PATH = Path.home() / ".claude" / ".credentials.json"
@@ -38,7 +53,7 @@ CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # public Claude CLI id
 BETA_HEADER = "oauth-2025-04-20"
 USER_AGENT = "claude-cli/1.0"
 REFRESH_BUFFER_SECS = 300
-POLL_INTERVAL_SECS = 300  # how often we re-fetch usage
+POLL_INTERVAL_SECS = 60  # how often we re-fetch usage
 
 # Latest fetch result, shared between the poll loop and the detail window.
 _state: dict = {"usage": None, "plan": "?", "error": None, "fetched_at": None}
@@ -248,6 +263,14 @@ def build_detail_text() -> str:
 
     out = [f"Plano: {plan}", ""]
 
+    try:
+        imp = usage_extras.impact_block(since_minutes=60)
+        if imp:
+            out.extend(imp)
+            out.append("")
+    except Exception:
+        pass  # analytics must never break the window
+
     blocks = [
         ("Janela de 5 horas", "five_hour",
          "Limite de curto prazo. Reseta a cada 5 horas a partir do primeiro uso da janela."),
@@ -300,8 +323,12 @@ def build_detail_text() -> str:
     return "\n".join(out)
 
 
-def _show_text_window(title: str, body: str, geometry: str = "520x460") -> None:
-    """Open a read-only dark text window in its own Tk mainloop (own thread)."""
+def _show_text_window(title: str, builder, geometry: str = "520x460") -> None:
+    """Open a read-only dark text window in its own Tk mainloop (own thread).
+
+    `builder` is a zero-arg callable returning the window text; the refresh
+    button forces a fresh usage fetch and re-renders with it.
+    """
     def run() -> None:
         root = tk.Tk()
         root.title(title)
@@ -311,9 +338,47 @@ def _show_text_window(title: str, body: str, geometry: str = "520x460") -> None:
             root, wrap="word", bg="#1e1e2e", fg="#e0e0e0",
             font=("Consolas", 11), borderwidth=0, padx=16, pady=14,
         )
-        text.insert("1.0", body)
         text.configure(state="disabled")
         text.pack(fill="both", expand=True)
+
+        def render() -> None:
+            text.configure(state="normal")
+            text.delete("1.0", "end")
+            text.insert("1.0", builder())
+            text.configure(state="disabled")
+
+        def do_refresh() -> None:
+            btn.configure(state="disabled", text="Atualizando…")
+            with _state_lock:
+                before = _state["fetched_at"]
+            _refresh_now.set()  # wake the poll loop for a fresh fetch
+
+            def wait_and_render() -> None:
+                # Wait until the poll loop stored a new fetch (max ~10s).
+                for _ in range(40):
+                    time.sleep(0.25)
+                    with _state_lock:
+                        if _state["fetched_at"] != before:
+                            break
+                try:
+                    root.after(0, lambda: (
+                        render(),
+                        btn.configure(state="normal", text="🔄 Atualizar"),
+                    ))
+                except tk.TclError:
+                    pass  # window closed while refreshing
+
+            threading.Thread(target=wait_and_render, daemon=True).start()
+
+        btn = tk.Button(
+            root, text="🔄 Atualizar", command=do_refresh,
+            bg="#2e2e40", fg="#e0e0e0", activebackground="#3a3a52",
+            activeforeground="#ffffff", borderwidth=0, padx=12, pady=6,
+            font=("Segoe UI", 10), cursor="hand2",
+        )
+        btn.pack(fill="x", side="bottom")
+
+        render()
         root.attributes("-topmost", True)
         root.mainloop()
 
@@ -321,7 +386,7 @@ def _show_text_window(title: str, body: str, geometry: str = "520x460") -> None:
 
 
 def show_detail_window() -> None:
-    _show_text_window("Limites de uso — Claude", build_detail_text())
+    _show_text_window("Limites de uso — Claude", build_detail_text)
 
 
 def build_token_text() -> str:
@@ -337,7 +402,38 @@ def build_token_text() -> str:
 
 
 def show_token_window() -> None:
-    _show_text_window("Tokens reais (7 dias) — Claude", build_token_text())
+    _show_text_window("Tokens reais (7 dias) — Claude", build_token_text)
+
+
+def build_activity_text() -> str:
+    """Recent-activity view: limit impact + per-bucket timeline + per-conversation."""
+    out: list[str] = []
+    try:
+        out.extend(usage_extras.impact_block(since_minutes=60))
+        if out:
+            out.append("")
+    except Exception as exc:
+        out.append(f"(impacto indisponível: {exc})")
+        out.append("")
+    try:
+        block = usage_extras.activity_block(minutes=60, bucket_min=10)
+        if block:
+            out.extend(block)
+    except Exception as exc:
+        out.append(f"(atividade indisponível: {exc})")
+    if not out:
+        return ("Sem atividade recente registrada.\n\n"
+                "O impacto nos limites precisa de ≥2 medições do histórico "
+                f"(coleta a cada {POLL_INTERVAL_SECS // 60} min); a atividade vem "
+                "dos logs em ~/.claude/projects/*.jsonl.")
+    out.append("Custo em US$ é equivalente-API (referência de volume; "
+               "Enterprise não cobra por token).")
+    return "\n".join(out)
+
+
+def show_activity_window() -> None:
+    _show_text_window("Atividade recente (1h) — Claude", build_activity_text,
+                      geometry="560x560")
 
 
 # --- Poll loop --------------------------------------------------------------
@@ -358,12 +454,12 @@ def update_loop(icon: Icon) -> None:
             except Exception:
                 pass  # analytics must never crash the tray
             icon.icon = make_icon_image(overall_pct(usage))
-            icon.title = short_tooltip(usage, plan)
+            icon.title = short_tooltip(usage, plan)[:TOOLTIP_MAX]
         except Exception as exc:  # never crash the tray; surface the error
             with _state_lock:
                 _state.update(error=str(exc), fetched_at=datetime.now())
             icon.icon = make_icon_image(0)
-            icon.title = f"Claude — erro\n{exc}"
+            icon.title = f"Claude — erro: {exc}"[:TOOLTIP_MAX]
         # Wake early if "Atualizar agora" was clicked; else poll on schedule.
         _refresh_now.wait(POLL_INTERVAL_SECS)
         _refresh_now.clear()
@@ -377,6 +473,7 @@ def main() -> None:
         menu=Menu(
             MenuItem("Detalhes dos limites", lambda i: show_detail_window(),
                      default=True),
+            MenuItem("Atividade recente (1h)", lambda i: show_activity_window()),
             MenuItem("Tokens reais (7 dias)", lambda i: show_token_window()),
             MenuItem("Atualizar agora", lambda i: _refresh_now.set()),
             Menu.SEPARATOR,
